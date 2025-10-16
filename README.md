@@ -176,7 +176,7 @@ class SearchResponse(BaseModel):
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/YOUR_USERNAME/RAG_1.git
+git clone https://github.com/santhoshchakilamcs/RAG_1.git
 cd RAG_1
 
 # 2. Run setup script
@@ -200,7 +200,7 @@ chmod +x run.sh
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/YOUR_USERNAME/RAG_1.git
+git clone https://github.com/santhoshchakilamcs/RAG_1.git
 cd RAG_1
 
 # 2. Create virtual environment
