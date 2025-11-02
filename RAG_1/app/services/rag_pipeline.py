@@ -1,19 +1,23 @@
 """RAG pipeline with completeness detection and structured output."""
 import json
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Optional
 from langchain_openai import ChatOpenAI
-from langchain.schema import Document, HumanMessage, SystemMessage
+from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.config import settings
 from app.models.schemas import (
     SearchResponse,
     SourceReference,
     EnrichmentSuggestion,
-    EnrichmentType
+    EnrichmentType,
+    IntentType,
+    IntentClassification
 )
 from app.services.vector_store import vector_store_service
 from app.services.enrichment_engine import enrichment_engine
+from app.services.true_agentic_intent_classifier import true_agentic_intent_classifier
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +82,10 @@ Guidelines:
 
         logger.info(f"Processing query: {query}")
 
+        # Step 0: Classify intent using TRUE agentic AI
+        intent_classification = await true_agentic_intent_classifier.classify_intent(query)
+        logger.info(f"Query intent: {intent_classification.intent.value} (confidence: {intent_classification.confidence:.2%})")
+
         # Step 1: Retrieve relevant documents
         retrieved_docs = await vector_store_service.similarity_search_with_score(
             query=query,
@@ -85,13 +93,16 @@ Guidelines:
         )
 
         if not retrieved_docs:
-            return self._create_no_documents_response(query)
+            response = self._create_no_documents_response(query)
+            response.intent_classification = intent_classification
+            return response
 
         # Step 2: Prepare context for LLM
         context = self._prepare_context(retrieved_docs)
 
         # Step 3: Generate answer with completeness detection
-        llm_response = await self._generate_answer(query, context, retrieved_docs)
+        # Use default system prompt (agentic classifier handles intent-specific logic)
+        llm_response = await self._generate_answer(query, context, retrieved_docs, self.SYSTEM_PROMPT)
 
         # Step 4: Automatic enrichment - fetch from external sources ONLY if answer is incomplete
         # This happens automatically without user intervention
@@ -128,16 +139,18 @@ Guidelines:
             context_enriched = self._prepare_context(retrieved_docs_enriched)
 
             # Generate new answer with enriched content
-            llm_response_enriched = await self._generate_answer(query, context_enriched, retrieved_docs_enriched)
+            llm_response_enriched = await self._generate_answer(query, context_enriched, retrieved_docs_enriched, self.SYSTEM_PROMPT)
 
             # Keep the enrichment suggestions from the first pass
             llm_response_enriched.enrichment_suggestions = llm_response.enrichment_suggestions
+            llm_response_enriched.intent_classification = intent_classification
 
             logger.info(f"Re-generated answer with enriched content. New confidence: {llm_response_enriched.confidence}")
 
             return llm_response_enriched
 
         logger.info(f"Generated answer with confidence: {llm_response.confidence}")
+        llm_response.intent_classification = intent_classification
 
         return llm_response
     
@@ -157,20 +170,24 @@ Guidelines:
         self,
         query: str,
         context: str,
-        retrieved_docs: List[tuple[Document, float]]
+        retrieved_docs: List[tuple[Document, float]],
+        system_prompt: str = None
     ) -> SearchResponse:
         """Generate answer using LLM with structured output."""
-        
+
+        if system_prompt is None:
+            system_prompt = self.SYSTEM_PROMPT
+
         user_prompt = f"""Context Documents:
 {context}
 
 User Question: {query}
 
 Please provide your response as a JSON object following the specified format."""
-        
+
         try:
             messages = [
-                SystemMessage(content=self.SYSTEM_PROMPT),
+                SystemMessage(content=system_prompt),
                 HumanMessage(content=user_prompt)
             ]
             

@@ -36,6 +36,15 @@ class SearchRequest(BaseModel):
     enable_auto_enrichment: Optional[bool] = True
 
 
+class IntentClassificationOutput(BaseModel):
+    """Intent classification output from agentic AI flow."""
+    intent: str
+    confidence: float
+    entities: List[str]
+    processing_strategy: str
+    reasoning: str
+
+
 class SearchResponse(BaseModel):
     """Search response model with structured output as per specifications."""
     query: str
@@ -47,6 +56,7 @@ class SearchResponse(BaseModel):
     enrichment_suggestions: List[dict] = []  # How to improve knowledge base
     auto_enrichment_applied: Optional[bool] = False
     auto_enrichment_sources: List[str] = []
+    intent_classification: Optional[IntentClassificationOutput] = None  # Agentic AI intent classification
 
 
 # Simple document processing functions
@@ -501,73 +511,39 @@ async def health_check():
 
 @router.post("/documents/upload", response_model=dict)
 async def upload_document(file: UploadFile = File(...)):
-    """Upload and process a document."""
+    """Upload and process a document using the document processor."""
     try:
         logger.info(f"Uploading document: {file.filename}")
 
-        # Validate file type
-        allowed_extensions = {'.pdf', '.txt', '.docx'}
-        file_extension = Path(file.filename).suffix.lower()
-
-        if file_extension not in allowed_extensions:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported file type. Allowed: {', '.join(allowed_extensions)}"
-            )
+        # Import locally to avoid pydantic v1/v2 conflicts
+        from app.services.document_processor import document_processor
+        from app.services.vector_store import vector_store_service
 
         # Read file content
         content = await file.read()
 
-        # Extract text from the document
-        text_content = extract_text_from_file(content, file.filename)
+        # Process document using the document processor
+        doc_id, chunks = await document_processor.process_upload(content, file.filename)
 
-        if not text_content:
-            raise HTTPException(
-                status_code=400,
-                detail="Could not extract text from the document"
-            )
+        logger.info(f"Document processed with ID: {doc_id}, created {len(chunks)} chunks")
 
-        # Save file to uploads directory
-        upload_dir = Path("./data/uploads")
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        file_path = upload_dir / file.filename
+        # Add chunks to vector store for semantic search
+        await vector_store_service.add_documents(chunks)
 
-        with open(file_path, "wb") as f:
-            f.write(content)
-
-        # Save extracted text for search
-        text_dir = Path("./data/extracted_text")
-        text_dir.mkdir(parents=True, exist_ok=True)
-        text_file_path = text_dir / f"{file.filename}.txt"
-
-        with open(text_file_path, "w", encoding="utf-8") as f:
-            f.write(text_content)
-
-        # Save metadata
-        metadata = {
-            "filename": file.filename,
-            "file_size": len(content),
-            "upload_timestamp": datetime.now().isoformat(),
-            "text_length": len(text_content),
-            "word_count": len(text_content.split())
-        }
-
-        metadata_dir = Path("./data/metadata")
-        metadata_dir.mkdir(parents=True, exist_ok=True)
-        metadata_file = metadata_dir / f"{file.filename}.json"
-
-        with open(metadata_file, "w") as f:
-            json.dump(metadata, f, indent=2)
+        logger.info(f"Added {len(chunks)} chunks to vector store")
 
         return {
             "message": "Document uploaded and processed successfully!",
             "filename": file.filename,
+            "document_id": doc_id,
             "file_size": len(content),
-            "text_extracted": len(text_content) > 0,
-            "word_count": len(text_content.split()),
+            "chunks_created": len(chunks),
             "status": "processed"
         }
 
+    except ValueError as e:
+        logger.error(f"Validation error uploading document: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Error uploading document: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -575,164 +551,112 @@ async def upload_document(file: UploadFile = File(...)):
 
 @router.post("/search", response_model=SearchResponse)
 async def search_knowledge_base(request: SearchRequest):
-    """Search the knowledge base and generate an answer."""
+    """Search the knowledge base and generate an answer using RAG pipeline with Agentic Intent Classification."""
     try:
         logger.info(f"Processing search query: {request.query}")
 
-        # Load processed documents
-        text_dir = Path("./data/extracted_text")
-        metadata_dir = Path("./data/metadata")
+        # Import locally to avoid pydantic v1/v2 conflicts
+        from app.services.rag_pipeline import RAGPipeline
+        from app.services.search_results_service import search_results_service
+        from app.services.true_agentic_intent_classifier import true_agentic_intent_classifier
 
-        if not text_dir.exists() or not metadata_dir.exists():
-            return SearchResponse(
-                query=request.query,
-                answer="No documents have been processed yet. Please upload some documents first to search through them.",
-                confidence=0.0,
-                is_complete=True,
-                sources=[],
-                missing_info=["No processed documents in knowledge base"],
-                enrichment_suggestions=[]
-            )
+        # Step 1: Agentic Intent Classification
+        logger.info(f"🤖 Starting Agentic Intent Classification for: {request.query}")
+        intent_classification = await true_agentic_intent_classifier.classify_intent(request.query)
+        logger.info(f"✅ Intent classified as: {intent_classification.intent.value} (confidence: {intent_classification.confidence:.2%})")
 
-        # Load all processed documents
-        documents = []
-        for text_file in text_dir.glob("*.txt"):
-            try:
-                # Load text content
-                with open(text_file, "r", encoding="utf-8") as f:
-                    content = f.read()
+        # Use the proper RAG pipeline with vector store and semantic search
+        rag_pipeline = RAGPipeline()
 
-                # Load metadata
-                metadata_file = metadata_dir / f"{text_file.stem}.json"
-                if metadata_file.exists():
-                    with open(metadata_file, "r") as f:
-                        metadata = json.load(f)
+        # Get top_k from request or use default
+        top_k = request.top_k if hasattr(request, 'top_k') and request.top_k else 5
 
-                    documents.append({
-                        "filename": metadata["filename"],
-                        "content": content,
-                        "metadata": metadata
-                    })
-            except Exception as e:
-                logger.error(f"Error loading document {text_file}: {e}")
-                continue
+        # Step 2: Execute RAG pipeline with semantic search
+        # Always enable auto-enrichment so external sources are fetched when needed
+        response = await rag_pipeline.search_and_answer(
+            query=request.query,
+            top_k=top_k,
+            enable_auto_enrichment=True  # Always enabled to fetch external sources when answer is incomplete
+        )
 
-        if not documents:
-            return SearchResponse(
-                query=request.query,
-                answer="No searchable documents found. Please upload and process some documents first.",
-                confidence=0.0,
-                is_complete=True,
-                sources=[],
-                missing_info=["No searchable content available"],
-                enrichment_suggestions=[]
-            )
+        logger.info(f"Generated answer with confidence: {response.confidence}")
 
-        # Perform search
-        search_results = simple_search(request.query, documents)
+        # Convert SourceReference objects to dicts for JSON serialization
+        sources_dict = []
+        if hasattr(response, 'sources') and response.sources:
+            for source in response.sources:
+                if hasattr(source, 'dict'):
+                    sources_dict.append(source.dict())
+                else:
+                    sources_dict.append(source)
 
-        if not search_results:
-            # No relevant documents found - suggest enrichment
-            return SearchResponse(
-                query=request.query,
-                answer=f"I searched through {len(documents)} document(s) but couldn't find relevant information about '{request.query}'. The knowledge base may need additional documents on this topic.",
-                confidence=0.0,
-                is_complete=False,
-                sources=[],
-                missing_info=[f"No relevant content found for '{request.query}'"],
-                enrichment_suggestions=[
-                    {
-                        "type": "document_upload",
-                        "description": f"Upload documents containing information about '{request.query}'",
-                        "priority": "high"
-                    },
-                    {
-                        "type": "query_refinement",
-                        "description": "Try using different keywords or phrases",
-                        "priority": "medium"
-                    },
-                    {
-                        "type": "external_search",
-                        "description": f"Search external sources for '{request.query}'",
-                        "priority": "medium"
-                    }
-                ]
-            )
-
-        # Generate AI-powered answer using RAG pipeline
-        rag_result = await generate_rag_answer(request.query, search_results)
-
-        # Apply auto-enrichment if enabled and answer is incomplete or no relevant documents
+        # Extract enrichment information
+        enrichment_suggestions_list = []
+        enrichment_suggestions_dicts = []
         auto_enrichment_applied = False
         auto_enrichment_sources = []
 
-        # Check if we should use auto-enrichment
-        # Trigger enrichment if:
-        # 1. Auto-enrichment is enabled AND
-        # 2. (Answer is incomplete OR low confidence OR no good search results OR answer indicates no info found)
-        answer_indicates_no_info = any(phrase in rag_result["answer"].lower() for phrase in [
-            "do not contain", "does not contain", "don't contain", "doesn't contain",
-            "no information", "not found", "cannot find", "can't find"
-        ])
+        if hasattr(response, 'enrichment_suggestions') and response.enrichment_suggestions:
+            enrichment_suggestions_list = response.enrichment_suggestions
+            # Convert to dicts for response
+            enrichment_suggestions_dicts = [
+                s.dict() if hasattr(s, 'dict') else s
+                for s in enrichment_suggestions_list
+            ]
+            # Check if any enrichment was from external sources
+            auto_enrichment_applied = any(
+                s.type.value == 'external_source' if hasattr(s.type, 'value') else s.type == 'external_source'
+                for s in enrichment_suggestions_list
+            )
+            # Extract source names
+            auto_enrichment_sources = [
+                s.suggestion for s in enrichment_suggestions_list
+                if (s.type.value == 'external_source' if hasattr(s.type, 'value') else s.type == 'external_source')
+            ]
 
-        should_enrich = (request.enable_auto_enrichment and
-                        (not rag_result["is_complete"] or
-                         rag_result["confidence"] < 0.7 or
-                         not search_results or
-                         all(r['relevance_score'] < 0.05 for r in search_results) or
-                         answer_indicates_no_info))
+        # Step 2.5: Save search result to JSON file with intent classification
+        try:
+            result_file = await search_results_service.save_search_result(
+                query=request.query,
+                answer=response.answer,
+                confidence=response.confidence,
+                is_complete=response.is_complete,
+                sources=sources_dict,
+                missing_info=response.missing_info,
+                enrichment_suggestions=enrichment_suggestions_dicts,
+                auto_enrichment_applied=auto_enrichment_applied,
+                auto_enrichment_sources=auto_enrichment_sources,
+                intent_classification={
+                    "intent": intent_classification.intent.value,
+                    "confidence": intent_classification.confidence,
+                    "entities": intent_classification.entities,
+                    "processing_strategy": intent_classification.processing_strategy,
+                    "reasoning": intent_classification.reasoning
+                }
+            )
+            logger.info(f"Search result saved to: {result_file}")
+        except Exception as e:
+            logger.error(f"Error saving search result: {e}")
+            # Don't fail the search if saving fails
 
-        # Debug logging
-        logger.info(f"Auto-enrichment check: enabled={request.enable_auto_enrichment}, "
-                   f"complete={rag_result['is_complete']}, confidence={rag_result['confidence']}, "
-                   f"no_info_detected={answer_indicates_no_info}, should_enrich={should_enrich}")
-
-        if should_enrich:
-            # Try auto-enrichment
-            logger.info(f"Attempting auto-enrichment for query: {request.query}")
-            enrichment_result = await attempt_auto_enrichment(request.query, rag_result["missing_info"])
-            logger.info(f"Enrichment result: success={enrichment_result['success']}, "
-                       f"content_length={len(enrichment_result.get('enriched_content', ''))}")
-
-            if enrichment_result["success"] and enrichment_result["enriched_content"]:
-                auto_enrichment_applied = True
-                auto_enrichment_sources = enrichment_result["sources"]
-                logger.info(f"Auto-enrichment applied from sources: {auto_enrichment_sources}")
-
-                # Generate enhanced answer with enriched content
-                try:
-                    # Combine document context (if any) with enriched content
-                    document_context = ""
-                    if search_results:
-                        for i, result in enumerate(search_results[:1]):  # Use top result
-                            document_context += f"Document Context:\n{result.get('content', '')}\n\n"
-
-                    enriched_context = f"External Knowledge from {', '.join(auto_enrichment_sources)}:\n{enrichment_result['enriched_content']}\n\n{document_context}"
-
-                    enhanced_answer = await generate_rag_answer_with_enrichment(request.query, enriched_context)
-                    rag_result["answer"] = enhanced_answer["answer"]
-                    rag_result["confidence"] = enhanced_answer["confidence"]
-                    rag_result["is_complete"] = enhanced_answer["is_complete"]
-                    rag_result["missing_info"] = []
-
-                except Exception as e:
-                    logger.error(f"Error generating enhanced answer: {e}")
-                    # Fallback: use enriched content directly
-                    rag_result["answer"] = enrichment_result["enriched_content"]
-                    rag_result["confidence"] = 0.8
-                    rag_result["is_complete"] = True
-                    rag_result["missing_info"] = []
-
+        # Step 3: Return response with intent classification
         return SearchResponse(
-            query=request.query,
-            answer=rag_result["answer"],
-            confidence=rag_result["confidence"],
-            is_complete=rag_result["is_complete"],
-            sources=search_results,
-            missing_info=rag_result["missing_info"],
-            enrichment_suggestions=rag_result["enrichment_suggestions"],
+            query=response.query,
+            answer=response.answer,
+            confidence=response.confidence,
+            is_complete=response.is_complete,
+            sources=sources_dict,
+            missing_info=response.missing_info,
+            enrichment_suggestions=enrichment_suggestions_dicts,
             auto_enrichment_applied=auto_enrichment_applied,
-            auto_enrichment_sources=auto_enrichment_sources
+            auto_enrichment_sources=auto_enrichment_sources,
+            intent_classification=IntentClassificationOutput(
+                intent=intent_classification.intent.value,
+                confidence=intent_classification.confidence,
+                entities=intent_classification.entities,
+                processing_strategy=intent_classification.processing_strategy,
+                reasoning=intent_classification.reasoning
+            )
         )
 
     except Exception as e:
@@ -914,5 +838,144 @@ async def get_rating_statistics():
 
     except Exception as e:
         logger.error(f"Error getting rating statistics: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/search-results")
+async def get_search_results(limit: int = 50):
+    """Get recent search results saved as JSON files."""
+    try:
+        from app.services.search_results_service import search_results_service
+
+        results = search_results_service.get_search_results(limit=limit)
+
+        return {
+            "total_results": len(results),
+            "results": results
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting search results: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/search-results/query/{query}")
+async def get_search_results_by_query(query: str):
+    """Get all search results for a specific query."""
+    try:
+        from app.services.search_results_service import search_results_service
+
+        results = search_results_service.get_search_result_by_query(query)
+
+        return {
+            "query": query,
+            "total_results": len(results),
+            "results": results
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting search results: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/search-results/statistics")
+async def get_search_results_statistics():
+    """Get statistics about search results."""
+    try:
+        from app.services.search_results_service import search_results_service
+
+        stats = search_results_service.get_statistics()
+
+        return stats
+
+    except Exception as e:
+        logger.error(f"Error getting search statistics: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Intent Classification Endpoints
+# ============================================================================
+
+@router.post("/classify-intent")
+async def classify_intent(request: dict):
+    """
+    Classify the intent of a user query using Agentic AI flow.
+
+    Args:
+        request: JSON with 'query' field
+
+    Returns:
+        Intent classification with type, confidence, and entities
+    """
+    try:
+        from app.services.true_agentic_intent_classifier import true_agentic_intent_classifier
+        from app.models.schemas import IntentClassificationResponse
+
+        query = request.get("query", "")
+        if not query:
+            raise HTTPException(status_code=400, detail="Query is required")
+
+        logger.info(f"🤖 Classifying intent for query using TRUE Agentic AI: {query[:100]}...")
+
+        # Classify intent using TRUE agentic AI flow
+        intent_classification = await true_agentic_intent_classifier.classify_intent(query)
+
+        # Create response
+        response = IntentClassificationResponse(
+            query=query,
+            intent_classification=intent_classification
+        )
+
+        logger.info(f"✅ Intent classified: {intent_classification.intent.value}")
+
+        return response.model_dump()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error classifying intent: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/intent-types")
+async def get_intent_types():
+    """
+    Get all available intent types.
+
+    Returns:
+        List of intent types with descriptions
+    """
+    try:
+        from app.models.schemas import IntentType
+
+        intent_descriptions = {
+            "factual_question": "User asks for facts, definitions, or information",
+            "comparison": "User compares two or more concepts",
+            "explanation": "User wants detailed explanation of a concept",
+            "how_to": "User asks for step-by-step instructions or tutorials",
+            "troubleshooting": "User reports a problem and seeks solution",
+            "recommendation": "User asks for suggestions or best practices",
+            "summary": "User asks for a summary or overview",
+            "clarification": "User asks for clarification on previous answer",
+            "related_topics": "User asks for related or similar topics",
+            "opinion": "User asks for opinion or discussion"
+        }
+
+        intent_types = [
+            {
+                "type": intent.value,
+                "description": intent_descriptions.get(intent.value, "")
+            }
+            for intent in IntentType
+        ]
+
+        return {
+            "intent_types": intent_types,
+            "total_count": len(intent_types)
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting intent types: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 

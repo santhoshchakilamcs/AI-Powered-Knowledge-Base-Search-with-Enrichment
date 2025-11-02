@@ -6,8 +6,8 @@ from typing import List, Dict, Any, Tuple
 from datetime import datetime
 import logging
 
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
 
 # Document parsers
 import pypdf

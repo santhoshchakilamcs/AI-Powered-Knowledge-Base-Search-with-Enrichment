@@ -13,6 +13,20 @@ class EnrichmentType(str, Enum):
     RELATED_TOPIC = "related_topic"
 
 
+class IntentType(str, Enum):
+    """Types of user query intents."""
+    FACTUAL_QUESTION = "factual_question"
+    COMPARISON = "comparison"
+    EXPLANATION = "explanation"
+    HOW_TO = "how_to"
+    TROUBLESHOOTING = "troubleshooting"
+    RECOMMENDATION = "recommendation"
+    SUMMARY = "summary"
+    CLARIFICATION = "clarification"
+    RELATED_TOPICS = "related_topics"
+    OPINION = "opinion"
+
+
 class SourceReference(BaseModel):
     """Reference to a source document."""
     document_id: str
@@ -51,6 +65,7 @@ class SearchResponse(BaseModel):
     enrichment_suggestions: List[EnrichmentSuggestion] = Field(default_factory=list)
     auto_enrichment_applied: bool = False
     auto_enrichment_sources: List[str] = Field(default_factory=list)
+    intent_classification: Optional['IntentClassification'] = None
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -93,6 +108,27 @@ class RatingResponse(BaseModel):
     """Response model for rating submission."""
     message: str = "Rating recorded successfully"
     rating_id: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
+class IntentClassification(BaseModel):
+    """Intent classification result for a query."""
+    intent: IntentType
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    entities: List[str] = Field(default_factory=list)
+    processing_strategy: str
+    reasoning: str = ""
+
+
+class IntentClassificationRequest(BaseModel):
+    """Request model for intent classification."""
+    query: str = Field(..., min_length=1, max_length=1000)
+
+
+class IntentClassificationResponse(BaseModel):
+    """Response model for intent classification."""
+    query: str
+    intent_classification: IntentClassification
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 

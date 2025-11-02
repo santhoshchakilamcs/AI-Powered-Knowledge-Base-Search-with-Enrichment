@@ -17,7 +17,7 @@ try:
 except ImportError:
     DUCKDUCKGO_AVAILABLE = False
 
-from langchain.schema import Document
+from langchain_core.documents import Document
 from app.services.vector_store import vector_store_service
 
 logger = logging.getLogger(__name__)
