@@ -1,2 +1,0 @@
-# RAG Knowledge Base Application
-
